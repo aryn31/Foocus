@@ -5,36 +5,45 @@ import Cocoa
 import ApplicationServices
 import ServiceManagement
 
-extension NSScreen {
-    var displayID: CGDirectDisplayID? {
-        deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID
-    }
-}
-
-/// Frame of an Accessibility window element, in top-left-origin global coordinates.
+/// Frame of an Accessibility window element, in top-left-origin global
+/// coordinates — the same space CGWindowList and CGDisplayBounds use.
 func axFrame(_ el: AXUIElement) -> CGRect? {
     var posV: CFTypeRef?
     var sizeV: CFTypeRef?
     guard AXUIElementCopyAttributeValue(el, kAXPositionAttribute as CFString, &posV) == .success,
           AXUIElementCopyAttributeValue(el, kAXSizeAttribute as CFString, &sizeV) == .success,
-          let posV, let sizeV else { return nil }
+          let posV, let sizeV,
+          CFGetTypeID(posV) == AXValueGetTypeID(), CFGetTypeID(sizeV) == AXValueGetTypeID()
+    else { return nil }
+    let pos = posV as! AXValue
+    let size = sizeV as! AXValue
+    guard AXValueGetType(pos) == .cgPoint, AXValueGetType(size) == .cgSize else { return nil }
     var p = CGPoint.zero
     var s = CGSize.zero
-    AXValueGetValue(posV as! AXValue, .cgPoint, &p)
-    AXValueGetValue(sizeV as! AXValue, .cgSize, &s)
+    guard AXValueGetValue(pos, .cgPoint, &p), AXValueGetValue(size, .cgSize, &s) else { return nil }
     return CGRect(origin: p, size: s)
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var pollTimer: Timer?
+    private var watchdogTimer: Timer?
     private var activity: NSObjectProtocol?
-    private var lastScreen: CGDirectDisplayID?
+    private var lastDisplay: CGDirectDisplayID?
     private let myPID = ProcessInfo.processInfo.processIdentifier
 
-    private var enabled: Bool {
-        get { UserDefaults.standard.object(forKey: "enabled") as? Bool ?? true }
-        set { UserDefaults.standard.set(newValue, forKey: "enabled") }
+    /// Never block the run loop for long on a wedged app's AX server.
+    private let axTimeout: Float = 0.25
+
+    // Diagnostics, surfaced in the menu so a silent failure is never silent again.
+    private var ticks = 0
+    private var crossings = 0
+    private var focused = 0
+    private var lastNote = "nothing yet"
+    private var lastTickAt = Date()
+
+    private var enabled: Bool = UserDefaults.standard.object(forKey: "enabled") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(enabled, forKey: "enabled") }
     }
 
     // MARK: Lifecycle
@@ -52,110 +61,185 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.menu = menu
 
         // Ask for Accessibility permission (needed to raise other apps' windows).
-        let opts = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
-        _ = AXIsProcessTrustedWithOptions(opts)
+        let trusted = AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary)
+        NSLog("ScreenFocus: launched · Accessibility %@", trusted ? "granted" : "NOT granted")
 
-        lastScreen = screenUnderMouse()?.displayID
+        lastDisplay = displayUnderCursor()
 
         // Keep macOS from App-Napping us; a napped app stops reacting.
         activity = ProcessInfo.processInfo.beginActivity(
             options: [.userInitiatedAllowingIdleSystemSleep, .latencyCritical],
             reason: "Watching which display the mouse is on")
 
-        // Poll the cursor position (20x/sec, negligible CPU). Unlike event
-        // monitors, this can't silently stop delivering.
-        let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
-            self?.tick()
-        }
-        timer.tolerance = 0.01
-        RunLoop.main.add(timer, forMode: .common)
-        pollTimer = timer
+        startPolling()
 
-        // Monitor plugged/unplugged or rearranged.
+        // A display being added, removed or rearranged invalidates which display
+        // the cursor is over; resync so the next move isn't read as a crossing.
         NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification,
             object: nil, queue: .main
         ) { [weak self] _ in
-            self?.lastScreen = self?.screenUnderMouse()?.displayID
+            guard let self else { return }
+            self.lastDisplay = self.displayUnderCursor()
+            self.note("display layout changed")
         }
+
+        // Timers can be left unscheduled across a sleep/wake cycle; rebuild.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.startPolling()
+            self.lastDisplay = self.displayUnderCursor()
+            self.note("woke from sleep")
+        }
+    }
+
+    /// Poll the cursor 20x/sec. Unlike an event monitor this can't silently stop
+    /// delivering, and the per-tick work is two cheap CoreGraphics queries.
+    private func startPolling() {
+        pollTimer?.invalidate()
+        let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in self?.tick() }
+        timer.tolerance = 0.01
+        RunLoop.main.add(timer, forMode: .common)
+        pollTimer = timer
+        lastTickAt = Date()
+
+        guard watchdogTimer == nil else { return }
+        let watchdog = Timer(timeInterval: 10, repeats: true) { [weak self] _ in
+            guard let self, Date().timeIntervalSince(self.lastTickAt) > 2 else { return }
+            self.note("poll timer stalled — restarted")
+            self.startPolling()
+        }
+        watchdog.tolerance = 5
+        RunLoop.main.add(watchdog, forMode: .common)
+        watchdogTimer = watchdog
     }
 
     // MARK: Core logic
+    //
+    // Everything below stays in CoreGraphics' global top-left-origin coordinate
+    // space: the cursor, the display bounds and the window bounds all come from
+    // CG. There is no NSScreen involved, so there is no cached screen list to go
+    // stale and no bottom-left/top-left flip to get wrong.
 
-    private func screenUnderMouse() -> NSScreen? {
-        let p = NSEvent.mouseLocation
-        return NSScreen.screens.first { NSMouseInRect(p, $0.frame, false) }
+    private func displayUnderCursor() -> CGDirectDisplayID? {
+        guard let p = CGEvent(source: nil)?.location else { return nil }
+        var id = CGDirectDisplayID(0)
+        var count: UInt32 = 0
+        guard CGGetDisplaysWithPoint(p, 1, &id, &count) == .success, count > 0 else { return nil }
+        return id
+    }
+
+    /// Record a diagnostic for the menu and mirror it to the unified log, so the
+    /// app can be diagnosed with `log stream --process ScreenFocus` as well.
+    private func note(_ message: String) {
+        lastNote = message
+        NSLog("ScreenFocus: %@", message)
+    }
+
+    private func activeDisplayCount() -> Int {
+        var count: UInt32 = 0
+        guard CGGetActiveDisplayList(0, nil, &count) == .success else { return 0 }
+        return Int(count)
     }
 
     private func tick() {
-        guard enabled,
-              let screen = screenUnderMouse(),
-              let id = screen.displayID,
-              id != lastScreen else { return }
-        lastScreen = id
+        lastTickAt = Date()
+        ticks += 1
 
-        // Dragging something across (e.g. a window)? Only track the screen.
-        guard NSEvent.pressedMouseButtons == 0 else { return }
+        guard enabled, let id = displayUnderCursor(), id != lastDisplay else { return }
+        lastDisplay = id
+        crossings += 1
 
-        if let w = topWindow(on: screen) {
-            focus(pid: w.pid, frame: w.frame)
+        // Dragging something across (e.g. a window)? Only track the display.
+        guard NSEvent.pressedMouseButtons == 0 else {
+            note("crossed while dragging — ignored")
+            return
         }
+
+        guard AXIsProcessTrusted() else {
+            note("no Accessibility permission — re-grant it in System Settings")
+            return
+        }
+
+        guard let target = topWindow(on: id) else {
+            note("no window found on display \(id)")
+            return
+        }
+        focus(pid: target.pid, window: target.window)
+        focused += 1
     }
 
-    /// Frontmost normal window whose centre lies on `screen`.
-    private func topWindow(on screen: NSScreen) -> (pid: pid_t, frame: CGRect)? {
-        guard let primary = NSScreen.screens.first else { return nil }
-        // Convert the screen frame (bottom-left origin) to CG coords (top-left origin).
-        let f = screen.frame
-        let target = CGRect(x: f.minX, y: primary.frame.maxY - f.maxY,
-                            width: f.width, height: f.height)
-
+    /// Frontmost real window whose centre lies on `display`.
+    ///
+    /// Candidates come from CGWindowList (front-to-back), but a CG window is not
+    /// necessarily a real window — browsers in particular publish thin toolbar and
+    /// overlay layers that sit in front of their actual window. Each candidate is
+    /// therefore resolved against the owning app's Accessibility window list, and
+    /// the first one that resolves wins. Anything that isn't a genuine window has
+    /// no AX counterpart and is skipped automatically.
+    private func topWindow(on display: CGDirectDisplayID) -> (pid: pid_t, window: AXUIElement)? {
+        let bounds = CGDisplayBounds(display)
         let opts: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
         guard let list = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]]
         else { return nil }
 
-        // The list is ordered front-to-back.
+        var probed = 0
         for w in list {
+            guard probed < 8 else { break }
             guard (w[kCGWindowLayer as String] as? Int) == 0,
                   let pid = w[kCGWindowOwnerPID as String] as? pid_t, pid != myPID,
                   (w[kCGWindowAlpha as String] as? Double ?? 1) > 0,
                   let b = w[kCGWindowBounds as String] as? [String: Any],
                   let rect = CGRect(dictionaryRepresentation: b as CFDictionary),
-                  rect.width > 50, rect.height > 50,
-                  target.contains(CGPoint(x: rect.midX, y: rect.midY))
+                  rect.width > 80, rect.height > 80,
+                  bounds.contains(CGPoint(x: rect.midX, y: rect.midY))
             else { continue }
-            return (pid, rect)
+
+            probed += 1
+            if let el = axWindow(pid: pid, matching: rect) {
+                note("focused \(w[kCGWindowOwnerName as String] as? String ?? "window") on display \(display)")
+                return (pid, el)
+            }
         }
         return nil
     }
 
-    private func focus(pid: pid_t, frame: CGRect) {
+    /// The app's AX window whose frame best fits `frame`, if one fits closely.
+    private func axWindow(pid: pid_t, matching frame: CGRect) -> AXUIElement? {
         let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, axTimeout)
 
-        // Find the matching AX window by position and size.
-        var window: AXUIElement?
         var value: CFTypeRef?
-        if AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
-           let windows = value as? [AXUIElement] {
-            window = windows.first { el in
-                guard let f = axFrame(el) else { return false }
-                return abs(f.minX - frame.minX) < 2 && abs(f.minY - frame.minY) < 2 &&
-                       abs(f.width - frame.width) < 2 && abs(f.height - frame.height) < 2
-            }
-        }
+        guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &value) == .success,
+              let windows = value as? [AXUIElement] else { return nil }
 
-        if let window {
-            AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
-            AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+        var best: (el: AXUIElement, error: CGFloat)?
+        for el in windows {
+            guard let f = axFrame(el) else { continue }
+            let error = abs(f.minX - frame.minX) + abs(f.minY - frame.minY)
+                      + abs(f.width - frame.width) + abs(f.height - frame.height)
+            if best == nil || error < best!.error { best = (el, error) }
         }
+        guard let best, best.error <= 8 else { return nil }
+        return best.el
+    }
+
+    private func focus(pid: pid_t, window: AXUIElement) {
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, axTimeout)
+        AXUIElementSetMessagingTimeout(window, axTimeout)
+
+        AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
+        AXUIElementPerformAction(window, kAXRaiseAction as CFString)
         AXUIElementSetAttributeValue(app, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
         NSRunningApplication(processIdentifier: pid)?.activate(options: [])
 
         // Some apps re-order their windows on activation; raise once more.
-        if let window {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                AXUIElementPerformAction(window, kAXRaiseAction as CFString)
-            }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            AXUIElementPerformAction(window, kAXRaiseAction as CFString)
         }
     }
 
@@ -174,22 +258,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(login)
 
-        if !AXIsProcessTrusted() {
-            menu.addItem(.separator())
+        menu.addItem(.separator())
+
+        if AXIsProcessTrusted() {
+            addInfo("Accessibility: granted", to: menu)
+        } else {
             let ax = NSMenuItem(title: "Grant Accessibility Access…",
                                 action: #selector(openAXSettings), keyEquivalent: "")
             ax.target = self
             menu.addItem(ax)
         }
+        addInfo("Displays: \(activeDisplayCount()) · crossings: \(crossings) · focused: \(focused)",
+                to: menu)
+        addInfo("Last: \(lastNote)", to: menu)
 
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit ScreenFocus",
                                 action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
     }
 
+    private func addInfo(_ title: String, to menu: NSMenu) {
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        item.isEnabled = false
+        menu.addItem(item)
+    }
+
     @objc private func toggleEnabled() {
         enabled.toggle()
-        lastScreen = screenUnderMouse()?.displayID
+        lastDisplay = displayUnderCursor()
     }
 
     @objc private func toggleLogin() {

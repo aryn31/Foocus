@@ -30,8 +30,30 @@ On first launch macOS asks for **Accessibility** access (System Settings → Pri
 ## How it works
 
 1. A lightweight timer checks which display the cursor is on (20×/sec), with App Nap disabled so it keeps running in the background.
-2. When the display under the cursor changes, `CGWindowListCopyWindowInfo` (front-to-back order) finds the topmost normal window whose centre lies on that display.
-3. The Accessibility API matches that window by position and size, marks it main, raises it, and makes its app frontmost.
+2. When the display under the cursor changes, `CGWindowListCopyWindowInfo` (front-to-back order) finds candidate windows whose centre lies on that display.
+3. Each candidate is resolved against the owning app's Accessibility window list. The first that resolves is marked main, raised, and its app made frontmost.
+
+Everything in the hot path stays in CoreGraphics' global top-left-origin coordinate
+space — `CGEvent.location` for the cursor, `CGGetDisplaysWithPoint` for the display
+under it, `CGDisplayBounds` for that display's rect, and `CGWindowList` for the
+windows. No `NSScreen` is involved, so there is no cached screen list that can go
+stale and no bottom-left/top-left flip to get wrong.
+
+Step 3 matters more than it looks: a CG window is not necessarily a real window.
+Browsers publish thin toolbar and overlay layers that sit *in front* of their actual
+window, and those have no Accessibility counterpart — so requiring an AX match is
+what skips them and lands on the window you meant.
+
+## Diagnostics
+
+The menu shows whether Accessibility is granted, the display count, how many
+display crossings have been seen, how many windows were focused, and the reason the
+last crossing did or didn't focus something. If focus-following ever stops, open the
+menu: it says why.
+
+A watchdog re-arms the poll timer if ticks ever stop, and the timer is also rebuilt
+on wake from sleep. Accessibility calls carry a 0.25s messaging timeout so an
+unresponsive app can't stall the menu bar.
 
 ## Alternative: Hammerspoon script
 
