@@ -27,7 +27,8 @@ func axFrame(_ el: AXUIElement) -> CGRect? {
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
-    private var monitor: Any?
+    private var pollTimer: Timer?
+    private var activity: NSObjectProtocol?
     private var lastScreen: CGDirectDisplayID?
     private let myPID = ProcessInfo.processInfo.processIdentifier
 
@@ -56,11 +57,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         lastScreen = screenUnderMouse()?.displayID
 
-        monitor = NSEvent.addGlobalMonitorForEvents(
-            matching: [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]
-        ) { [weak self] event in
-            self?.handle(event)
+        // Keep macOS from App-Napping us; a napped app stops reacting.
+        activity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiatedAllowingIdleSystemSleep, .latencyCritical],
+            reason: "Watching which display the mouse is on")
+
+        // Poll the cursor position (20x/sec, negligible CPU). Unlike event
+        // monitors, this can't silently stop delivering.
+        let timer = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
+            self?.tick()
         }
+        timer.tolerance = 0.01
+        RunLoop.main.add(timer, forMode: .common)
+        pollTimer = timer
 
         // Monitor plugged/unplugged or rearranged.
         NotificationCenter.default.addObserver(
@@ -78,7 +87,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return NSScreen.screens.first { NSMouseInRect(p, $0.frame, false) }
     }
 
-    private func handle(_ event: NSEvent) {
+    private func tick() {
         guard enabled,
               let screen = screenUnderMouse(),
               let id = screen.displayID,
@@ -86,7 +95,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         lastScreen = id
 
         // Dragging something across (e.g. a window)? Only track the screen.
-        guard event.type == .mouseMoved, NSEvent.pressedMouseButtons == 0 else { return }
+        guard NSEvent.pressedMouseButtons == 0 else { return }
 
         if let w = topWindow(on: screen) {
             focus(pid: w.pid, frame: w.frame)

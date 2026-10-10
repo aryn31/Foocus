@@ -29,7 +29,7 @@ On first launch macOS asks for **Accessibility** access (System Settings → Pri
 
 ## How it works
 
-1. A global event monitor watches mouse movement.
+1. A lightweight timer checks which display the cursor is on (20×/sec), with App Nap disabled so it keeps running in the background.
 2. When the display under the cursor changes, `CGWindowListCopyWindowInfo` (front-to-back order) finds the topmost normal window whose centre lies on that display.
 3. The Accessibility API matches that window by position and size, marks it main, raises it, and makes its app frontmost.
 
